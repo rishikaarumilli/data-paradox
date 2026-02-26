@@ -22,7 +22,7 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     theme TEXT,
     actual_value REAL,
-    status TEXT DEFAULT 'open' -- 'open', 'closed', 'revealed'
+    status TEXT DEFAULT 'open'
   );
 
   CREATE TABLE IF NOT EXISTS settings (
@@ -61,7 +61,6 @@ async function startServer() {
     }
   });
 
-  // Admin Middleware
   const adminAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const password = req.headers['x-admin-password'];
     const correctPassword = process.env.ADMIN_PASSWORD || 'admin123';
@@ -72,7 +71,6 @@ async function startServer() {
     }
   };
 
-  // API Routes
   app.get("/api/settings", (req, res) => {
     const settings = db.prepare("SELECT * FROM settings").all();
     const result = settings.reduce((acc: any, curr: any) => {
@@ -124,7 +122,7 @@ async function startServer() {
 
   app.post("/api/submissions", (req, res) => {
     const { teamId, roundId, predictedValue, bidAmount } = req.body;
-    
+
     const team = db.prepare("SELECT balance FROM teams WHERE id = ?").get(teamId);
     if (!team || team.balance < bidAmount) {
       return res.status(400).json({ error: "Insufficient balance" });
@@ -144,29 +142,43 @@ async function startServer() {
     res.json({ success: true });
   });
 
+  // 🔥 UPDATED SCORING SYSTEM (20–25% RULE)
   app.post("/api/admin/rounds/reveal", adminAuth, (req, res) => {
     const { roundId, actualValue } = req.body;
-    
+
     db.prepare("UPDATE rounds SET actual_value = ?, status = 'revealed' WHERE id = ?")
       .run(actualValue, roundId);
 
     const submissions = db.prepare("SELECT * FROM submissions WHERE round_id = ?").all(roundId);
 
     for (const sub of submissions) {
+
       const error = Math.abs(sub.predicted_value - actualValue);
-      const errorPercent = actualValue === 0 ? (sub.predicted_value === 0 ? 0 : 100) : (error / actualValue) * 100;
-      
-      let multiplier = 1;
-      if (errorPercent <= 2) multiplier = 3;
-      else if (errorPercent <= 5) multiplier = 2;
-      else if (errorPercent <= 10) multiplier = 1.5;
 
-      const baseScore = sub.bid_amount * (1 / (1 + errorPercent));
-      let finalScore = baseScore * multiplier;
+      const errorPercent = actualValue === 0
+        ? (sub.predicted_value === 0 ? 0 : 100)
+        : (error / actualValue) * 100;
 
-      // Rule: If %Error > 25%, lose full bid
-      if (errorPercent > 25) {
+      let multiplier = 0;
+
+      if (errorPercent <= 5) {
+        multiplier = 3;
+      } else if (errorPercent <= 10) {
+        multiplier = 2;
+      } else if (errorPercent <= 20) {
+        multiplier = 1.5;
+      } else if (errorPercent <= 25) {
+        multiplier = 1;
+      } else {
+        multiplier = -1; // Lose full bid
+      }
+
+      let finalScore = 0;
+
+      if (multiplier === -1) {
         finalScore = 0;
+      } else {
+        finalScore = sub.bid_amount * multiplier;
       }
 
       db.prepare("UPDATE submissions SET score = ?, error_percent = ? WHERE id = ?")
@@ -191,7 +203,6 @@ async function startServer() {
   });
 
   app.post("/api/admin/reset", adminAuth, (req, res) => {
-    console.log("Admin requested game reset");
     try {
       db.exec(`
         DELETE FROM submissions;
@@ -200,16 +211,13 @@ async function startServer() {
         DELETE FROM sqlite_sequence WHERE name IN ('submissions', 'rounds', 'teams');
       `);
 
-      console.log("Database cleared successfully");
       broadcast({ type: "GAME_RESET" });
       res.json({ success: true });
     } catch (error) {
-      console.error("Reset error:", error);
       res.status(500).json({ error: "Database reset failed" });
     }
   });
 
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -224,7 +232,6 @@ async function startServer() {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 
-  // WebSocket Setup
   const wss = new WebSocketServer({ server });
   const clients = new Set<WebSocket>();
 

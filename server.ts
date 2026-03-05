@@ -1,51 +1,67 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { WebSocketServer, WebSocket } from "ws";
-import Database from "better-sqlite3";
+import pkg from "pg";
+const { Pool } = pkg;
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database("data_paradox.db");
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-// Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS teams (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE,
-    balance REAL DEFAULT 2000
-  );
+async function initDB() {
 
-  CREATE TABLE IF NOT EXISTS rounds (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    theme TEXT,
-    actual_value REAL,
-    status TEXT DEFAULT 'open'
-  );
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS teams (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE,
+      balance FLOAT DEFAULT 2000
+    )
+  `);
 
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  );
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS rounds (
+      id SERIAL PRIMARY KEY,
+      theme TEXT,
+      actual_value FLOAT,
+      status TEXT DEFAULT 'open'
+    )
+  `);
 
-  CREATE TABLE IF NOT EXISTS submissions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id INTEGER,
-    round_id INTEGER,
-    predicted_value REAL,
-    bid_amount REAL,
-    score REAL DEFAULT 0,
-    error_percent REAL,
-    FOREIGN KEY(team_id) REFERENCES teams(id),
-    FOREIGN KEY(round_id) REFERENCES rounds(id)
-  );
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
 
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('game_title', 'DATA PARADOX');
-`);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS submissions (
+      id SERIAL PRIMARY KEY,
+      team_id INTEGER,
+      round_id INTEGER,
+      predicted_value FLOAT,
+      bid_amount FLOAT,
+      score FLOAT DEFAULT 0,
+      error_percent FLOAT
+    )
+  `);
+
+  await db.query(`
+    INSERT INTO settings (key,value)
+    VALUES ('game_title','DATA PARADOX')
+    ON CONFLICT (key) DO NOTHING
+  `);
+
+}
 
 async function startServer() {
+
   const app = express();
   const PORT = 3000;
 
@@ -53,7 +69,8 @@ async function startServer() {
 
   app.post("/api/admin/login", (req, res) => {
     const { password } = req.body;
-    const correctPassword = process.env.ADMIN_PASSWORD || 'admin123';
+    const correctPassword = process.env.ADMIN_PASSWORD || "admin123";
+
     if (password === correctPassword) {
       res.json({ success: true });
     } else {
@@ -61,9 +78,11 @@ async function startServer() {
     }
   });
 
-  const adminAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const password = req.headers['x-admin-password'];
-    const correctPassword = process.env.ADMIN_PASSWORD || 'admin123';
+  const adminAuth = (req:any, res:any, next:any) => {
+
+    const password = req.headers["x-admin-password"];
+    const correctPassword = process.env.ADMIN_PASSWORD || "admin123";
+
     if (password === correctPassword) {
       next();
     } else {
@@ -71,183 +90,247 @@ async function startServer() {
     }
   };
 
-  app.get("/api/settings", (req, res) => {
-    const settings = db.prepare("SELECT * FROM settings").all();
-    const result = settings.reduce((acc: any, curr: any) => {
-      acc[curr.key] = curr.value;
-      return acc;
-    }, {});
-    res.json(result);
+  app.get("/api/settings", async (req, res) => {
+
+    const result = await db.query("SELECT * FROM settings");
+
+    const settings:any = {};
+
+    result.rows.forEach(row => {
+      settings[row.key] = row.value;
+    });
+
+    res.json(settings);
+
   });
 
-  app.post("/api/admin/settings", adminAuth, (req, res) => {
+  app.post("/api/admin/settings", adminAuth, async (req, res) => {
+
     const { key, value } = req.body;
-    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
-    broadcast({ type: "SETTINGS_UPDATED", key, value });
-    res.json({ success: true });
+
+    await db.query(
+      `INSERT INTO settings (key,value)
+       VALUES ($1,$2)
+       ON CONFLICT (key)
+       DO UPDATE SET value = $2`,
+      [key,value]
+    );
+
+    broadcast({ type:"SETTINGS_UPDATED",key,value });
+
+    res.json({ success:true });
+
   });
 
-  app.get("/api/teams", (req, res) => {
-    const teams = db.prepare("SELECT * FROM teams ORDER BY balance DESC").all();
-    res.json(teams);
+  app.get("/api/teams", async (req, res) => {
+
+    const teams = await db.query(
+      "SELECT * FROM teams ORDER BY balance DESC"
+    );
+
+    res.json(teams.rows);
+
   });
 
-  app.post("/api/teams/join", (req, res) => {
+  app.post("/api/teams/join", async (req, res) => {
+
     const { name } = req.body;
+
     try {
-      const info = db.prepare("INSERT INTO teams (name) VALUES (?)").run(name);
-      res.json({ id: info.lastInsertRowid, name, balance: 2000 });
-    } catch (e) {
-      const team = db.prepare("SELECT * FROM teams WHERE name = ?").get(name);
-      if (team) {
-        res.json(team);
-      } else {
-        res.status(400).json({ error: "Failed to join" });
-      }
+
+      const result = await db.query(
+        "INSERT INTO teams (name) VALUES ($1) RETURNING *",
+        [name]
+      );
+
+      res.json(result.rows[0]);
+
+    } catch {
+
+      const team = await db.query(
+        "SELECT * FROM teams WHERE name=$1",
+        [name]
+      );
+
+      res.json(team.rows[0]);
+
     }
+
   });
 
-  app.get("/api/rounds/current", (req, res) => {
-    const round = db.prepare("SELECT * FROM rounds ORDER BY id DESC LIMIT 1").get();
-    res.json(round || null);
+  app.get("/api/rounds/current", async (req, res) => {
+
+    const round = await db.query(
+      "SELECT * FROM rounds ORDER BY id DESC LIMIT 1"
+    );
+
+    res.json(round.rows[0] || null);
+
   });
 
-  app.post("/api/admin/rounds", adminAuth, (req, res) => {
+  app.post("/api/admin/rounds", adminAuth, async (req, res) => {
+
     const { theme } = req.body;
-    db.prepare("UPDATE rounds SET status = 'revealed' WHERE status != 'revealed'").run();
-    const info = db.prepare("INSERT INTO rounds (theme) VALUES (?)").run(theme);
-    broadcast({ type: "ROUND_STARTED", round: { id: info.lastInsertRowid, theme, status: 'open' } });
-    res.json({ id: info.lastInsertRowid, theme });
+
+    await db.query(
+      "UPDATE rounds SET status='revealed' WHERE status!='revealed'"
+    );
+
+    const result = await db.query(
+      "INSERT INTO rounds (theme) VALUES ($1) RETURNING *",
+      [theme]
+    );
+
+    broadcast({
+      type:"ROUND_STARTED",
+      round:result.rows[0]
+    });
+
+    res.json(result.rows[0]);
+
   });
 
-  app.post("/api/submissions", (req, res) => {
+  app.post("/api/submissions", async (req, res) => {
+
     const { teamId, roundId, predictedValue, bidAmount } = req.body;
 
-    const team = db.prepare("SELECT balance FROM teams WHERE id = ?").get(teamId);
-    if (!team || team.balance < bidAmount) {
-      return res.status(400).json({ error: "Insufficient balance" });
+    const team = await db.query(
+      "SELECT balance FROM teams WHERE id=$1",
+      [teamId]
+    );
+
+    if (!team.rows.length || team.rows[0].balance < bidAmount) {
+      return res.status(400).json({ error:"Insufficient balance" });
     }
 
-    const existing = db.prepare("SELECT id FROM submissions WHERE team_id = ? AND round_id = ?").get(teamId, roundId);
-    if (existing) {
-      return res.status(400).json({ error: "Already submitted for this round" });
+    const existing = await db.query(
+      "SELECT id FROM submissions WHERE team_id=$1 AND round_id=$2",
+      [teamId,roundId]
+    );
+
+    if (existing.rows.length) {
+      return res.status(400).json({ error:"Already submitted" });
     }
 
-    db.prepare(`
-      INSERT INTO submissions (team_id, round_id, predicted_value, bid_amount)
-      VALUES (?, ?, ?, ?)
-    `).run(teamId, roundId, predictedValue, bidAmount);
+    await db.query(
+      `INSERT INTO submissions
+       (team_id,round_id,predicted_value,bid_amount)
+       VALUES ($1,$2,$3,$4)`,
+      [teamId,roundId,predictedValue,bidAmount]
+    );
 
-    broadcast({ type: "SUBMISSION_RECEIVED", teamId });
-    res.json({ success: true });
+    broadcast({ type:"SUBMISSION_RECEIVED",teamId });
+
+    res.json({ success:true });
+
   });
 
-  // 🔥 UPDATED SCORING SYSTEM (20–25% RULE)
-  app.post("/api/admin/rounds/reveal", adminAuth, (req, res) => {
+  app.post("/api/admin/rounds/reveal", adminAuth, async (req, res) => {
+
     const { roundId, actualValue } = req.body;
 
-    db.prepare("UPDATE rounds SET actual_value = ?, status = 'revealed' WHERE id = ?")
-      .run(actualValue, roundId);
+    await db.query(
+      "UPDATE rounds SET actual_value=$1,status='revealed' WHERE id=$2",
+      [actualValue,roundId]
+    );
 
-    const submissions = db.prepare("SELECT * FROM submissions WHERE round_id = ?").all(roundId);
+    const submissions = await db.query(
+      "SELECT * FROM submissions WHERE round_id=$1",
+      [roundId]
+    );
 
-    for (const sub of submissions) {
+    for (const sub of submissions.rows) {
 
       const error = Math.abs(sub.predicted_value - actualValue);
 
-      const errorPercent = actualValue === 0
-        ? (sub.predicted_value === 0 ? 0 : 100)
-        : (error / actualValue) * 100;
+      const errorPercent =
+        actualValue === 0
+          ? (sub.predicted_value === 0 ? 0 : 100)
+          : (error / actualValue) * 100;
 
       let multiplier = 0;
 
-      if (errorPercent <= 5) {
-        multiplier = 3;
-      } else if (errorPercent <= 10) {
-        multiplier = 2;
-      } else if (errorPercent <= 20) {
-        multiplier = 1.5;
-      } else if (errorPercent <= 25) {
-        multiplier = 1;
-      } else {
-        multiplier = -1; // Lose full bid
-      }
+      if (errorPercent <= 5) multiplier = 3;
+      else if (errorPercent <= 10) multiplier = 2;
+      else if (errorPercent <= 20) multiplier = 1.5;
+      else if (errorPercent <= 25) multiplier = 1;
+      else multiplier = -1;
 
-      let finalScore = 0;
+      let finalScore = multiplier === -1 ? 0 : sub.bid_amount * multiplier;
 
-      if (multiplier === -1) {
-        finalScore = 0;
-      } else {
-        finalScore = sub.bid_amount * multiplier;
-      }
+      await db.query(
+        "UPDATE submissions SET score=$1,error_percent=$2 WHERE id=$3",
+        [finalScore,errorPercent,sub.id]
+      );
 
-      db.prepare("UPDATE submissions SET score = ?, error_percent = ? WHERE id = ?")
-        .run(finalScore, errorPercent, sub.id);
+      await db.query(
+        "UPDATE teams SET balance=balance-$1+$2 WHERE id=$3",
+        [sub.bid_amount,finalScore,sub.team_id]
+      );
 
-      db.prepare("UPDATE teams SET balance = balance - ? + ? WHERE id = ?")
-        .run(sub.bid_amount, finalScore, sub.team_id);
     }
 
-    broadcast({ type: "ROUND_REVEALED", roundId, actualValue });
-    res.json({ success: true });
+    broadcast({ type:"ROUND_REVEALED",roundId,actualValue });
+
+    res.json({ success:true });
+
   });
 
-  app.get("/api/admin/submissions/:roundId", adminAuth, (req, res) => {
-    const subs = db.prepare(`
-      SELECT s.*, t.name as team_name 
-      FROM submissions s 
-      JOIN teams t ON s.team_id = t.id 
-      WHERE s.round_id = ?
-    `).all(req.params.roundId);
-    res.json(subs);
-  });
+  app.post("/api/admin/reset", adminAuth, async (req, res) => {
 
-  app.post("/api/admin/reset", adminAuth, (req, res) => {
-    try {
-      db.exec(`
-        DELETE FROM submissions;
-        DELETE FROM rounds;
-        DELETE FROM teams;
-        DELETE FROM sqlite_sequence WHERE name IN ('submissions', 'rounds', 'teams');
-      `);
+    await db.query("DELETE FROM submissions");
+    await db.query("DELETE FROM rounds");
+    await db.query("DELETE FROM teams");
 
-      broadcast({ type: "GAME_RESET" });
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ error: "Database reset failed" });
-    }
+    broadcast({ type:"GAME_RESET" });
+
+    res.json({ success:true });
+
   });
 
   if (process.env.NODE_ENV !== "production") {
+
     const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
+      server:{ middlewareMode:true },
+      appType:"spa"
     });
+
     app.use(vite.middlewares);
+
   } else {
-    app.use(express.static(path.join(__dirname, "dist")));
+
+    app.use(express.static(path.join(__dirname,"dist")));
+
   }
 
-  const server = app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  const server = app.listen(PORT,"0.0.0.0",() => {
+    console.log(`Server running on ${PORT}`);
   });
 
   const wss = new WebSocketServer({ server });
+
   const clients = new Set<WebSocket>();
 
-  wss.on("connection", (ws) => {
+  wss.on("connection",(ws)=>{
+
     clients.add(ws);
-    ws.on("close", () => clients.delete(ws));
+
+    ws.on("close",()=>clients.delete(ws));
+
   });
 
-  function broadcast(data: any) {
+  function broadcast(data:any){
+
     const message = JSON.stringify(data);
-    clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
+
+    clients.forEach(client=>{
+      if(client.readyState===WebSocket.OPEN){
         client.send(message);
       }
     });
+
   }
+
 }
 
-startServer();
+initDB().then(startServer);
